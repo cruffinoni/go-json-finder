@@ -13,75 +13,6 @@ func newScannerWithBuffer(input string, bufferSize int) scanner {
 	return scanner{r: bufio.NewReaderSize(strings.NewReader(input), bufferSize)}
 }
 
-func TestSkipString(t *testing.T) {
-	tests := []struct {
-		name         string
-		input        string
-		bufferSize   int
-		wantErrSub   string
-		checkNext    bool
-		wantNextByte byte
-	}{
-		{
-			name:         "backslash at chunk boundary",
-			input:        `abc\"def",`,
-			bufferSize:   4,
-			checkNext:    true,
-			wantNextByte: ',',
-		},
-		{
-			name:         "escaped unicode survives boundaries",
-			input:        `abc\u0041def",`,
-			bufferSize:   5,
-			checkNext:    true,
-			wantNextByte: ',',
-		},
-		{
-			name:       "control character is rejected",
-			input:      "ab" + string([]byte{0x1f}) + `c"`,
-			bufferSize: 4,
-			wantErrSub: "invalid control character in string",
-		},
-		{
-			name:       "unexpected EOF in string",
-			input:      `unterminated`,
-			bufferSize: 4,
-			wantErrSub: "unexpected EOF while reading string",
-		},
-	}
-
-	for _, tt := range tests {
-		tt := tt
-		t.Run(tt.name, func(t *testing.T) {
-			s := newScannerWithBuffer(tt.input, tt.bufferSize)
-
-			err := s.skipString()
-			if tt.wantErrSub != "" {
-				if err == nil {
-					t.Fatal("expected error, got nil")
-				}
-				if !strings.Contains(err.Error(), tt.wantErrSub) {
-					t.Fatalf("unexpected error: %v", err)
-				}
-				return
-			}
-
-			if err != nil {
-				t.Fatalf("skipString returned error: %v", err)
-			}
-			if tt.checkNext {
-				next, err := s.r.ReadByte()
-				if err != nil {
-					t.Fatalf("failed to read next byte: %v", err)
-				}
-				if next != tt.wantNextByte {
-					t.Fatalf("unexpected trailing byte: got %q want %q", next, tt.wantNextByte)
-				}
-			}
-		})
-	}
-}
-
 func TestReadString(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -270,6 +201,82 @@ func TestReadKeyEquals(t *testing.T) {
 	}
 }
 
+func TestSkipString(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		bufferSize   int
+		wantErrSub   string
+		checkNext    bool
+		wantNextByte byte
+	}{
+		{
+			name:         "stops on closing quote",
+			input:        `abc",tail`,
+			bufferSize:   4,
+			checkNext:    true,
+			wantNextByte: ',',
+		},
+		{
+			name:         "handles escaped quote",
+			input:        `abc\"def",tail`,
+			bufferSize:   4,
+			checkNext:    true,
+			wantNextByte: ',',
+		},
+		{
+			name:       "invalid escape is rejected",
+			input:      `abc\x",tail`,
+			bufferSize: 4,
+			wantErrSub: "invalid escape sequence",
+		},
+		{
+			name:       "invalid unicode hex is rejected",
+			input:      `abc\u12G4",tail`,
+			bufferSize: 4,
+			wantErrSub: "invalid hex digit",
+		},
+		{
+			name:       "control character is rejected",
+			input:      "ab" + string([]byte{0x1f}) + `c"`,
+			bufferSize: 4,
+			wantErrSub: "invalid control character in string",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			s := newScannerWithBuffer(tt.input, tt.bufferSize)
+
+			err := s.skipString()
+			if tt.wantErrSub != "" {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tt.wantErrSub) {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("skipString returned error: %v", err)
+			}
+
+			if tt.checkNext {
+				next, err := s.r.ReadByte()
+				if err != nil {
+					t.Fatalf("failed to read next byte: %v", err)
+				}
+				if next != tt.wantNextByte {
+					t.Fatalf("unexpected trailing byte: got %q want %q", next, tt.wantNextByte)
+				}
+			}
+		})
+	}
+}
+
 func TestExtractorExtract(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -289,19 +296,34 @@ func TestExtractorExtract(t *testing.T) {
 			wantValue: "android",
 		},
 		{
-			name:      "nested channel is first structural match",
+			name:      "nested channel is ignored in favor of top level key",
 			payload:   `{"meta":{"channel":"email"},"channel":"ios"}`,
-			wantValue: "email",
+			wantValue: "ios",
 		},
 		{
-			name:      "escaped channel key is recognized",
+			name:      "escaped nested channel key is ignored",
 			payload:   `{"meta":{"chann\u0065l":"sms"},"channel":"ios"}`,
-			wantValue: "sms",
+			wantValue: "ios",
 		},
 		{
 			name:      "channel key in string is ignored",
 			payload:   `{"body":"... here is text: \\\"channel\\\":\\\"ios\\\" ...","channel":"email"}`,
 			wantValue: "email",
+		},
+		{
+			name:      "non channel key is skipped before next key",
+			payload:   `{"body":"hello","channel":"sms"}`,
+			wantValue: "sms",
+		},
+		{
+			name:      "non channel nested array is skipped before next key",
+			payload:   `{"meta":[1,2,3],"channel":"ios"}`,
+			wantValue: "ios",
+		},
+		{
+			name:      "non channel nested object with comma is skipped before next key",
+			payload:   `{"meta":{"a":1,"b":2},"channel":"push"}`,
+			wantValue: "push",
 		},
 		{
 			name:    "channel number invalid type",
@@ -334,13 +356,48 @@ func TestExtractorExtract(t *testing.T) {
 			wantErr: extractor.ErrChannelNotFound,
 		},
 		{
+			name:    "missing channel with trailing whitespace",
+			payload: "{\"body\":\"hello\"}  \n\t",
+			wantErr: extractor.ErrChannelNotFound,
+		},
+		{
+			name:            "missing channel with trailing non space returns parse error",
+			payload:         `{"body":"hello"} x`,
+			wantAnyParseErr: true,
+		},
+		{
+			name:      "skipped high surrogate without low surrogate is tolerated",
+			payload:   `{"body":"\uD83Dx","channel":"ok"}`,
+			wantValue: "ok",
+		},
+		{
+			name:            "invalid escape in skipped value returns parse error",
+			payload:         `{"body":"bad\x","channel":"ok"}`,
+			wantAnyParseErr: true,
+		},
+		{
+			name:            "invalid unicode hex in skipped value returns parse error",
+			payload:         `{"body":"bad\u12G4","channel":"ok"}`,
+			wantAnyParseErr: true,
+		},
+		{
+			name:            "strict channel string still rejects high surrogate without low surrogate",
+			payload:         `{"channel":"\uD83Dx"}`,
+			wantAnyParseErr: true,
+		},
+		{
 			name:            "invalid json returns parse error",
 			payload:         `{"body":"unterminated}`,
 			wantAnyParseErr: true,
 		},
 		{
-			name:      "multiple top level values are scanned in order",
-			payload:   `{} {"channel":"push"}`,
+			name:            "multiple top level values return parse error in strict mode",
+			payload:         `{} {"channel":"push"}`,
+			wantAnyParseErr: true,
+		},
+		{
+			name:      "channel match returns before trailing validation",
+			payload:   `{"channel":"push"} trailing`,
 			wantValue: "push",
 		},
 	}

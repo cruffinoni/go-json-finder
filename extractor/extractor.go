@@ -10,7 +10,7 @@ import (
 // Extractor defines a channel extraction strategy.
 //
 // Implementations intentionally differ in scope:
-// - decoder scans tokens and can find nested "channel" keys.
+// - decoder scans only top-level object members for "channel".
 // - structs decodes only top-level "channel" into a struct field.
 type Extractor interface {
 	Name() string

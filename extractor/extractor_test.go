@@ -68,10 +68,8 @@ func TestExtractors(t *testing.T) {
 		},
 		"nested channel": {
 			payload: `{"meta":{"channel":"email"},"body":"hello"}`,
-			wantValue: map[string]string{
-				"decoder": "email",
-			},
 			wantErr: map[string]error{
+				"decoder":  extractor.ErrChannelNotFound,
 				"fastjson": extractor.ErrChannelNotFound,
 				"gjson":    extractor.ErrChannelNotFound,
 				"struct":   extractor.ErrChannelNotFound,
@@ -79,10 +77,8 @@ func TestExtractors(t *testing.T) {
 		},
 		"nested channel (pretty)": {
 			payload: mustPrettyJSON(`{"meta":{"channel":"email"},"body":"hello"}`),
-			wantValue: map[string]string{
-				"decoder": "email",
-			},
 			wantErr: map[string]error{
+				"decoder":  extractor.ErrChannelNotFound,
 				"fastjson": extractor.ErrChannelNotFound,
 				"gjson":    extractor.ErrChannelNotFound,
 				"struct":   extractor.ErrChannelNotFound,
@@ -119,30 +115,28 @@ func TestExtractors(t *testing.T) {
 				"struct":   extractor.ErrChannelInvalidType,
 			},
 		},
-		"nested channel non string takes precedence for decoder": {
+		"nested non string channel does not affect top level match": {
 			payload: `{"meta":{"channel":123},"channel":"android"}`,
 			wantValue: map[string]string{
+				"decoder":  "android",
 				"fastjson": "android",
 				"gjson":    "android",
 				"struct":   "android",
 			},
-			wantErr: map[string]error{
-				"decoder": extractor.ErrChannelInvalidType,
-			},
 		},
-		"escaped nested channel key is detected by decoder": {
+		"escaped nested channel key is ignored before top level match": {
 			payload: `{"meta":{"chann\u0065l":"sms"},"channel":"ios"}`,
 			wantValue: map[string]string{
-				"decoder":  "sms",
+				"decoder":  "ios",
 				"fastjson": "ios",
 				"gjson":    "ios",
 				"struct":   "ios",
 			},
 		},
-		"escaped nested channel key is detected by decoder (pretty)": {
+		"escaped nested channel key is ignored before top level match (pretty)": {
 			payload: mustPrettyJSON(`{"meta":{"chann\u0065l":"sms"},"channel":"ios"}`),
 			wantValue: map[string]string{
-				"decoder":  "sms",
+				"decoder":  "ios",
 				"fastjson": "ios",
 				"gjson":    "ios",
 				"struct":   "ios",
