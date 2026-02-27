@@ -13,6 +13,15 @@ import (
 
 type Extractor struct{}
 
+func typeName(t fastjson.Type) string {
+	switch t {
+	case fastjson.TypeTrue, fastjson.TypeFalse:
+		return "boolean"
+	default:
+		return t.String()
+	}
+}
+
 // Name returns the extractor identifier.
 func (Extractor) Name() string {
 	return "fastjson"
@@ -24,10 +33,21 @@ func (Extractor) Extract(r io.Reader) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("read payload: %w", err)
 	}
-	channel := fastjson.GetString(body, "channel")
-	if channel == "" {
+
+	var p fastjson.Parser
+	value, err := p.ParseBytes(body)
+	if err != nil {
+		return "", fmt.Errorf("parse payload: %w", err)
+	}
+
+	channel := value.Get("channel")
+	if channel == nil {
 		return "", extractor.ErrChannelNotFound
 	}
 
-	return channel, nil
+	if channel.Type() != fastjson.TypeString {
+		return "", fmt.Errorf("%w: got %s", extractor.ErrChannelInvalidType, typeName(channel.Type()))
+	}
+
+	return string(channel.GetStringBytes()), nil
 }
