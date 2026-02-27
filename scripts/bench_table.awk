@@ -7,7 +7,15 @@ BEGIN {
 
 	caseWidth = 24
 	implWidth = 8
-	winnerWidth = 10
+	winnerWidth = 12
+
+	implCount = split("decoder struct gjson fastjson sonic go-json easyjson", impls, " ")
+	for (i = 1; i <= implCount; i++) {
+		allowed[impls[i]] = 1
+		if (length(impls[i]) > implWidth) {
+			implWidth = length(impls[i])
+		}
+	}
 }
 
 /^goos: / {
@@ -29,7 +37,7 @@ BEGIN {
 
 	impl = parts[2]
 	sub(/-[0-9]+$/, "", impl)
-	if (impl != "decoder" && impl != "struct" && impl != "gjson" && impl != "fastjson") {
+	if (!(impl in allowed)) {
 		next
 	}
 
@@ -50,49 +58,33 @@ function exists(arr, caseName, impl) {
 	return ((caseName SUBSEP impl) in arr)
 }
 
-function metricWinner(hasD, d, hasS, s, hasG, g, hasF, f,    min, winners, count) {
+function metricWinner(caseName, arr,    i, impl, min, v, winners, count) {
 	min = -1
-	if (hasD) {
-		min = d
-	}
-	if (hasS && (min < 0 || s < min)) {
-		min = s
-	}
-	if (hasG && (min < 0 || g < min)) {
-		min = g
-	}
-	if (hasF && (min < 0 || f < min)) {
-		min = f
+	for (i = 1; i <= implCount; i++) {
+		impl = impls[i]
+		if (!exists(arr, caseName, impl)) {
+			continue
+		}
+		v = arr[caseName, impl] + 0
+		if (min < 0 || v < min) {
+			min = v
+		}
 	}
 	if (min < 0) {
 		return "n/a"
 	}
 
-	count = 0
 	winners = ""
-	if (hasD && d == min) {
-		winners = winners "decoder"
-		count++
-	}
-	if (hasS && s == min) {
+	count = 0
+	for (i = 1; i <= implCount; i++) {
+		impl = impls[i]
+		if (!exists(arr, caseName, impl) || arr[caseName, impl] != min) {
+			continue
+		}
 		if (winners != "") {
 			winners = winners ","
 		}
-		winners = winners "struct"
-		count++
-	}
-	if (hasG && g == min) {
-		if (winners != "") {
-			winners = winners ","
-		}
-		winners = winners "gjson"
-		count++
-	}
-	if (hasF && f == min) {
-		if (winners != "") {
-			winners = winners ","
-		}
-		winners = winners "fastjson"
+		winners = winners impl
 		count++
 	}
 
@@ -102,50 +94,40 @@ function metricWinner(hasD, d, hasS, s, hasG, g, hasF, f,    min, winners, count
 	return winners
 }
 
-function sideStatus(hasV, v, hasD, d, hasS, s, hasG, g, hasF, f,    min, minCount) {
-	if (!hasV) {
+function sideStatus(caseName, impl, arr,    i, cur, min, v, minCount) {
+	if (!exists(arr, caseName, impl)) {
 		return "na"
 	}
 
 	min = -1
-	if (hasD) {
-		min = d
+	for (i = 1; i <= implCount; i++) {
+		cur = impls[i]
+		if (!exists(arr, caseName, cur)) {
+			continue
+		}
+		v = arr[caseName, cur] + 0
+		if (min < 0 || v < min) {
+			min = v
+		}
 	}
-	if (hasS && (min < 0 || s < min)) {
-		min = s
-	}
-	if (hasG && (min < 0 || g < min)) {
-		min = g
-	}
-	if (hasF && (min < 0 || f < min)) {
-		min = f
-	}
-
 	if (min < 0) {
 		return "na"
 	}
 
 	minCount = 0
-	if (hasD && d == min) {
-		minCount++
-	}
-	if (hasS && s == min) {
-		minCount++
-	}
-	if (hasG && g == min) {
-		minCount++
-	}
-	if (hasF && f == min) {
-		minCount++
+	for (i = 1; i <= implCount; i++) {
+		cur = impls[i]
+		if (exists(arr, caseName, cur) && arr[caseName, cur] == min) {
+			minCount++
+		}
 	}
 
-	if (v == min) {
+	if (arr[caseName, impl] == min) {
 		if (minCount > 1) {
 			return "tie"
 		}
 		return "win"
 	}
-
 	return "lose"
 }
 
@@ -188,63 +170,37 @@ function repeat(ch, times,    out, i) {
 	return out
 }
 
-function printMetricTable(title, arr, kind,    i, caseName, hasD, hasS, hasG, hasF, d, s, g, f, dText, sText, gText, fText, dStatus, sStatus, gStatus, fStatus, winner) {
+function printMetricTable(title, arr, kind,    i, j, caseName, impl, hasV, v, text, status, winner, row, header, sep) {
 	print ""
 	printf("== %s ==\n", title)
 
-	printf("%-*s | %-*s | %-*s | %-*s | %-*s | %-*s\n",
-		caseWidth, "Case",
-		implWidth, "decoder",
-		implWidth, "struct",
-		implWidth, "gjson",
-		implWidth, "fjson",
-		winnerWidth, "winner")
+	header = sprintf("%-*s", caseWidth, "Case")
+	sep = repeat("-", caseWidth)
+	for (i = 1; i <= implCount; i++) {
+		impl = impls[i]
+		header = header " | " sprintf("%-*s", implWidth, impl)
+		sep = sep "-+-" repeat("-", implWidth)
+	}
+	header = header " | " sprintf("%-*s", winnerWidth, "winner")
+	sep = sep "-+-" repeat("-", winnerWidth)
 
-	printf("%s-+-%s-+-%s-+-%s-+-%s-+-%s\n",
-		repeat("-", caseWidth),
-		repeat("-", implWidth),
-		repeat("-", implWidth),
-		repeat("-", implWidth),
-		repeat("-", implWidth),
-		repeat("-", winnerWidth))
+	print header
+	print sep
 
 	for (i = 1; i <= count; i++) {
 		caseName = order[i]
-
-		hasD = exists(arr, caseName, "decoder")
-		hasS = exists(arr, caseName, "struct")
-		hasG = exists(arr, caseName, "gjson")
-		hasF = exists(arr, caseName, "fastjson")
-
-		d = arr[caseName, "decoder"]
-		s = arr[caseName, "struct"]
-		g = arr[caseName, "gjson"]
-		f = arr[caseName, "fastjson"]
-
-		dText = metricText(hasD, d, kind)
-		sText = metricText(hasS, s, kind)
-		gText = metricText(hasG, g, kind)
-		fText = metricText(hasF, f, kind)
-
-		dStatus = sideStatus(hasD, d, hasD, d, hasS, s, hasG, g, hasF, f)
-		sStatus = sideStatus(hasS, s, hasD, d, hasS, s, hasG, g, hasF, f)
-		gStatus = sideStatus(hasG, g, hasD, d, hasS, s, hasG, g, hasF, f)
-		fStatus = sideStatus(hasF, f, hasD, d, hasS, s, hasG, g, hasF, f)
-
-		dText = paint(sprintf("%*s", implWidth, dText), dStatus)
-		sText = paint(sprintf("%*s", implWidth, sText), sStatus)
-		gText = paint(sprintf("%*s", implWidth, gText), gStatus)
-		fText = paint(sprintf("%*s", implWidth, fText), fStatus)
-
-		winner = metricWinner(hasD, d, hasS, s, hasG, g, hasF, f)
-
-		printf("%-*s | %s | %s | %s | %s | %-*s\n",
-			caseWidth, caseName,
-			dText,
-			sText,
-			gText,
-			fText,
-			winnerWidth, winner)
+		row = sprintf("%-*s", caseWidth, caseName)
+		for (j = 1; j <= implCount; j++) {
+			impl = impls[j]
+			hasV = exists(arr, caseName, impl)
+			v = arr[caseName, impl]
+			text = metricText(hasV, v, kind)
+			status = sideStatus(caseName, impl, arr)
+			row = row " | " paint(sprintf("%*s", implWidth, text), status)
+		}
+		winner = metricWinner(caseName, arr)
+		row = row " | " sprintf("%-*s", winnerWidth, winner)
+		print row
 	}
 }
 

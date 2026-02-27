@@ -2,3 +2,4 @@
 .DS_STORE
 vendor/
 profiles/
+bench-history/
