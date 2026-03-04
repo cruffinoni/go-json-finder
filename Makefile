@@ -4,7 +4,9 @@ SHELL := /bin/bash
 .DEFAULT_GOAL := help
 
 GO_TEST ?= go test
-BENCH_COUNT ?= 5
+BENCH_COUNT ?= 7
+BENCH_OUTPUT ?=
+BENCH_TRACE ?=0
 
 BENCH_ARGS := ./extractor -run=^$$ -bench=BenchmarkExtract_ -benchmem -count=$(BENCH_COUNT)
 BENCH_ARGS_DECODER_ONLY := ./extractor -run=^$$ -bench='BenchmarkExtract_.*/decoder' -benchmem -count=$(BENCH_COUNT)
@@ -48,6 +50,7 @@ help:
 	@echo "Targets:"
 	@echo "  make test          Run all unit tests"
 	@echo "  make bench         Run benchmarks and print a compact cross-extractor summary"
+	@echo "                     Options: BENCH_OUTPUT=<path> (save output), BENCH_TRACE=1 (enable shell trace)"
 	@echo "  make compare       Compare decoder-only benchmark results with baseline"
 	@echo "  make compare-large Compare decoder-only large-case benchmark results with baseline"
 	@echo "  make compare-update-baseline  Refresh baseline benchmark file (backs up previous baseline)"
@@ -59,12 +62,30 @@ test:
 bench:
 	@tmp_file="$$(mktemp)"; \
 	trap 'rm -f "$$tmp_file"' EXIT; \
-	$(GO_TEST) $(BENCH_ARGS) | tee "$$tmp_file"; \
+	bench_output="$(BENCH_OUTPUT)"; \
+	if [ -n "$$bench_output" ]; then \
+		mkdir -p "$$(dirname "$$bench_output")"; \
+		: > "$$bench_output"; \
+	fi; \
+	if [ "$(BENCH_TRACE)" = "1" ]; then set -x; fi; \
+	if [ -n "$$bench_output" ]; then \
+		$(GO_TEST) $(BENCH_ARGS) | tee "$$tmp_file" | tee -a "$$bench_output"; \
+	else \
+		$(GO_TEST) $(BENCH_ARGS) | tee "$$tmp_file"; \
+	fi; \
 	use_color=1; \
-	if [ -n "$$NO_COLOR" ] || [ ! -t 1 ]; then use_color=0; fi; \
-	echo ""; \
-	echo "=== Summary by metric (decoder | struct | gjson | fastjson | sonic | go-json | easyjson, lower is better) ==="; \
-	awk -v USE_COLOR="$$use_color" -f scripts/bench_table.awk "$$tmp_file"
+	if [ -n "$$bench_output" ] || [ -n "$$NO_COLOR" ] || [ ! -t 1 ]; then use_color=0; fi; \
+	if [ -n "$$bench_output" ]; then \
+		{ \
+			echo ""; \
+			echo "=== Summary by metric (decoder | struct | gjson | fastjson | sonic | go-json | easyjson, lower is better) ==="; \
+			awk -v USE_COLOR="$$use_color" -f scripts/bench_table.awk "$$tmp_file"; \
+		} | tee -a "$$bench_output"; \
+	else \
+		echo ""; \
+		echo "=== Summary by metric (decoder | struct | gjson | fastjson | sonic | go-json | easyjson, lower is better) ==="; \
+		awk -v USE_COLOR="$$use_color" -f scripts/bench_table.awk "$$tmp_file"; \
+	fi
 
 compare-update-baseline:
 	@mkdir -p $(BENCH_HISTORY_FOLDER)

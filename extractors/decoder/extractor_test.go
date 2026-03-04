@@ -3,6 +3,7 @@ package decoder
 import (
 	"bufio"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -11,6 +12,162 @@ import (
 
 func newScannerWithBuffer(input string, bufferSize int) scanner {
 	return scanner{r: bufio.NewReaderSize(strings.NewReader(input), bufferSize)}
+}
+
+type readSpy struct {
+	src    []byte
+	off    int
+	maxReq int
+}
+
+func (r *readSpy) Read(p []byte) (int, error) {
+	if len(p) > r.maxReq {
+		r.maxReq = len(p)
+	}
+	if r.off >= len(r.src) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.src[r.off:])
+	r.off += n
+	return n, nil
+}
+
+func TestFindStringStop(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       []byte
+		wantIndex   int
+		wantSpecial byte
+	}{
+		{
+			name:      "no special byte",
+			input:     []byte("abcdefghijklmnopqrstuvwxyz"),
+			wantIndex: -1,
+		},
+		{
+			name:        "quote terminator",
+			input:       []byte("abc\"tail"),
+			wantIndex:   3,
+			wantSpecial: '"',
+		},
+		{
+			name:        "backslash before quote",
+			input:       []byte("abc\\\"tail"),
+			wantIndex:   3,
+			wantSpecial: '\\',
+		},
+		{
+			name:        "control character before markers",
+			input:       []byte{'a', 'b', 0x1f, '"'},
+			wantIndex:   2,
+			wantSpecial: 0x1f,
+		},
+		{
+			name:        "boundary across 8 byte block",
+			input:       []byte("abcdefgh\"tail"),
+			wantIndex:   8,
+			wantSpecial: '"',
+		},
+		{
+			name:        "earliest candidate in same block",
+			input:       []byte{'x', '\\', '"', 0x1f, 'z'},
+			wantIndex:   1,
+			wantSpecial: '\\',
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			index, special := findStringStop(tt.input)
+			if index != tt.wantIndex {
+				t.Fatalf("unexpected index: got %d want %d", index, tt.wantIndex)
+			}
+			if special != tt.wantSpecial {
+				t.Fatalf("unexpected special byte: got %q want %q", special, tt.wantSpecial)
+			}
+		})
+	}
+}
+
+func TestCappedReader(t *testing.T) {
+	base := strings.NewReader("abcdefghijkl")
+	cr := &cappedReader{}
+	cr.reset(base, 4)
+
+	buf := make([]byte, 10)
+	n, err := cr.Read(buf)
+	if err != nil {
+		t.Fatalf("first read returned error: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("unexpected first read length: got %d want 4", n)
+	}
+	if string(buf[:n]) != "abcd" {
+		t.Fatalf("unexpected first read content: got %q", string(buf[:n]))
+	}
+
+	n, err = cr.Read(buf)
+	if err != nil {
+		t.Fatalf("second read returned error: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("unexpected second read length: got %d want 4", n)
+	}
+	if string(buf[:n]) != "efgh" {
+		t.Fatalf("unexpected second read content: got %q", string(buf[:n]))
+	}
+
+	cr.setMaxReadChunk(8)
+	n, err = cr.Read(buf)
+	if err != nil {
+		t.Fatalf("third read returned error: %v", err)
+	}
+	if n != 4 {
+		t.Fatalf("unexpected third read length: got %d want 4", n)
+	}
+	if string(buf[:n]) != "ijkl" {
+		t.Fatalf("unexpected third read content: got %q", string(buf[:n]))
+	}
+}
+
+func TestExtractorReadCapBehavior(t *testing.T) {
+	ext := Extractor{}
+
+	t.Run("early channel keeps initial cap", func(t *testing.T) {
+		payload := []byte(`{"channel":"ios","body":"` + strings.Repeat("x", 256*1024) + `"}`)
+		spy := &readSpy{src: payload}
+
+		got, err := ext.Extract(spy)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "ios" {
+			t.Fatalf("unexpected channel: got %q want %q", got, "ios")
+		}
+		if spy.maxReq > initialReadChunkCap {
+			t.Fatalf("unexpected max read size for early path: got %d > %d", spy.maxReq, initialReadChunkCap)
+		}
+	})
+
+	t.Run("late channel promotes to larger cap", func(t *testing.T) {
+		payload := []byte(`{"body":"` + strings.Repeat("x", 256*1024) + `","channel":"ios"}`)
+		spy := &readSpy{src: payload}
+
+		got, err := ext.Extract(spy)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != "ios" {
+			t.Fatalf("unexpected channel: got %q want %q", got, "ios")
+		}
+		if spy.maxReq <= initialReadChunkCap {
+			t.Fatalf("expected read cap promotion; max read request stayed at %d", spy.maxReq)
+		}
+		if spy.maxReq > lateReadChunkCap {
+			t.Fatalf("unexpected max read size after promotion: got %d > %d", spy.maxReq, lateReadChunkCap)
+		}
+	})
 }
 
 func TestReadString(t *testing.T) {
@@ -373,6 +530,11 @@ func TestExtractorExtract(t *testing.T) {
 		{
 			name:            "invalid escape in skipped value returns parse error",
 			payload:         `{"body":"bad\x","channel":"ok"}`,
+			wantAnyParseErr: true,
+		},
+		{
+			name:            "invalid control character in skipped composite string returns parse error",
+			payload:         "{\"meta\":{\"body\":\"ab" + string([]byte{0x1f}) + "c\"},\"channel\":\"ok\"}",
 			wantAnyParseErr: true,
 		},
 		{

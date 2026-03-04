@@ -162,6 +162,54 @@ function metricText(hasV, v, kind) {
 	return (kind == "ns") ? fmtNs(v) : fmtInt(v)
 }
 
+function signedMetricText(v, kind) {
+	if (kind == "ns") {
+		if (v >= 1000 || v <= -1000) {
+			return sprintf("%+.0f", v)
+		}
+		return sprintf("%+.1f", v)
+	}
+	return sprintf("%+.0f", v)
+}
+
+function metricFirstSecondDiff(caseName, arr, kind,    i, impl, v, found, first, second, absDelta, pct, absText) {
+	found = 0
+	first = -1
+	second = -1
+
+	for (i = 1; i <= implCount; i++) {
+		impl = impls[i]
+		if (!exists(arr, caseName, impl)) {
+			continue
+		}
+		v = arr[caseName, impl] + 0
+		found++
+
+		if (first < 0 || v < first) {
+			second = first
+			first = v
+			continue
+		}
+
+		if (second < 0 || v < second) {
+			second = v
+		}
+	}
+
+	if (found < 2 || second < 0) {
+		return "n/a"
+	}
+
+	if (second == first) {
+		return "0 (0%)"
+	}
+
+	absDelta = second - first
+	pct = (first > 0) ? ((absDelta / first) * 100) : 0
+	absText = signedMetricText(absDelta, kind)
+	return absText " (" sprintf("%+.1f", pct) "%)"
+}
+
 function repeat(ch, times,    out, i) {
 	out = ""
 	for (i = 0; i < times; i++) {
@@ -170,9 +218,18 @@ function repeat(ch, times,    out, i) {
 	return out
 }
 
-function printMetricTable(title, arr, kind,    i, j, caseName, impl, hasV, v, text, status, winner, row, header, sep) {
+function printMetricTable(title, arr, kind,    i, j, caseName, impl, hasV, v, text, status, winner, diff, diffWidth, row, header, sep) {
 	print ""
 	printf("== %s ==\n", title)
+
+	diffWidth = length("diff(1st,2nd)")
+	for (i = 1; i <= count; i++) {
+		caseName = order[i]
+		diff = metricFirstSecondDiff(caseName, arr, kind)
+		if (length(diff) > diffWidth) {
+			diffWidth = length(diff)
+		}
+	}
 
 	header = sprintf("%-*s", caseWidth, "Case")
 	sep = repeat("-", caseWidth)
@@ -181,6 +238,8 @@ function printMetricTable(title, arr, kind,    i, j, caseName, impl, hasV, v, te
 		header = header " | " sprintf("%-*s", implWidth, impl)
 		sep = sep "-+-" repeat("-", implWidth)
 	}
+	header = header " | " sprintf("%-*s", diffWidth, "diff(1st,2nd)")
+	sep = sep "-+-" repeat("-", diffWidth)
 	header = header " | " sprintf("%-*s", winnerWidth, "winner")
 	sep = sep "-+-" repeat("-", winnerWidth)
 
@@ -198,6 +257,8 @@ function printMetricTable(title, arr, kind,    i, j, caseName, impl, hasV, v, te
 			status = sideStatus(caseName, impl, arr)
 			row = row " | " paint(sprintf("%*s", implWidth, text), status)
 		}
+		diff = metricFirstSecondDiff(caseName, arr, kind)
+		row = row " | " sprintf("%*s", diffWidth, diff)
 		winner = metricWinner(caseName, arr)
 		row = row " | " sprintf("%-*s", winnerWidth, winner)
 		print row
