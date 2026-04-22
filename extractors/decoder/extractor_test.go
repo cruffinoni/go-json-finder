@@ -76,10 +76,11 @@ func TestFindStringStop(t *testing.T) {
 		},
 	}
 
+	s := scanner{}
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			index, special := findStringStop(tt.input)
+			index, special := s.findStringStop(tt.input)
 			if index != tt.wantIndex {
 				t.Fatalf("unexpected index: got %d want %d", index, tt.wantIndex)
 			}
@@ -132,7 +133,10 @@ func TestCappedReader(t *testing.T) {
 }
 
 func TestExtractorReadCapBehavior(t *testing.T) {
-	ext := Extractor{}
+	ext, err := NewExtractor("channel")
+	if err != nil {
+		t.Fatalf("NewExtractor returned unexpected error: %v", err)
+	}
 
 	t.Run("early channel keeps initial cap", func(t *testing.T) {
 		payload := []byte(`{"channel":"ios","body":"` + strings.Repeat("x", 256*1024) + `"}`)
@@ -327,7 +331,7 @@ func TestReadKeyEquals(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			s := newScannerWithBuffer(tt.input, tt.bufferSize)
 
-			matched, err := s.readKeyEquals(channelKey)
+			matched, err := s.readKeyEquals("channel")
 			if tt.wantErrSub != "" {
 				if err == nil {
 					t.Fatalf("expected error containing %q, got matched=%v", tt.wantErrSub, matched)
@@ -564,7 +568,10 @@ func TestExtractorExtract(t *testing.T) {
 		},
 	}
 
-	ext := Extractor{}
+	ext, err := NewExtractor("channel")
+	if err != nil {
+		t.Fatalf("NewExtractor returned unexpected error: %v", err)
+	}
 
 	for _, tt := range tests {
 		tt := tt
@@ -596,6 +603,80 @@ func TestExtractorExtract(t *testing.T) {
 			}
 			if got != tt.wantValue {
 				t.Fatalf("unexpected value: got %q want %q", got, tt.wantValue)
+			}
+		})
+	}
+}
+
+func TestNewExtractor(t *testing.T) {
+	tests := []struct {
+		name         string
+		key          string
+		payload      string
+		wantKey      string
+		wantValue    string
+		wantErr      bool
+		useZeroValue bool
+	}{
+		{
+			name:    "valid key is stored",
+			key:     "channel",
+			wantKey: "channel",
+		},
+		{
+			name:    "empty key returns error",
+			key:     "",
+			wantErr: true,
+		},
+		{
+			name:         "zero value returns error on Extract",
+			useZeroValue: true,
+			payload:      `{"channel":"ios"}`,
+			wantErr:      true,
+		},
+		{
+			name:      "custom key is respected",
+			key:       "routing_key",
+			payload:   `{"channel":"ios","routing_key":"sms"}`,
+			wantValue: "sms",
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.useZeroValue {
+				var e Extractor
+				_, err := e.Extract(strings.NewReader(tt.payload))
+				if tt.wantErr && err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+
+			ext, err := NewExtractor(tt.key)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if tt.wantKey != "" && ext.key != tt.wantKey {
+				t.Fatalf("unexpected key: got %q want %q", ext.key, tt.wantKey)
+			}
+
+			if tt.payload != "" {
+				got, extractErr := ext.Extract(strings.NewReader(tt.payload))
+				if extractErr != nil {
+					t.Fatalf("unexpected error: %v", extractErr)
+				}
+				if got != tt.wantValue {
+					t.Fatalf("unexpected value: got %q want %q", got, tt.wantValue)
+				}
 			}
 		})
 	}

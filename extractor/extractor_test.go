@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/cruffinoni/go-json-finder/extractor"
-	"github.com/cruffinoni/go-json-finder/extractors/decoder"
 	"github.com/cruffinoni/go-json-finder/extractors/easyjson"
 	"github.com/cruffinoni/go-json-finder/extractors/fastjson"
 	"github.com/cruffinoni/go-json-finder/extractors/gjson"
@@ -43,7 +42,7 @@ func expectedErr(err error) map[string]error {
 
 func TestExtractors(t *testing.T) {
 	extractors := []extractor.Extractor{
-		decoder.Extractor{},
+		mustNewExtractor("channel"),
 		fastjson.Extractor{},
 		gjson.Extractor{},
 		gojson.Extractor{},

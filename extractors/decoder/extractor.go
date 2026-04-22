@@ -1,5 +1,7 @@
-// Package decoder provides a streaming extractor that scans root object
-// members and returns the first top-level "channel" key value.
+// Package decoder provides a high-performance streaming JSON extractor.
+// It scans only top-level object members, returning the string value of a
+// configurable key without allocating the full document.
+// Construct an extractor with [NewExtractor].
 package decoder
 
 import (
@@ -16,9 +18,21 @@ import (
 	"github.com/cruffinoni/go-json-finder/extractor"
 )
 
-// Extractor implements extractor.Extractor with a streaming scanner that
-// stops as soon as the first top-level "channel" value is extracted.
-type Extractor struct{}
+// Extractor is a streaming JSON extractor configured for a specific top-level key.
+// Construct with NewExtractor; a zero-value Extractor is not valid.
+type Extractor struct {
+	key string
+}
+
+// NewExtractor returns an Extractor that extracts the string value of the
+// given top-level JSON key. key must be a non-empty, plain ASCII string
+// (no escape sequences). It returns an error if key is empty.
+func NewExtractor(key string) (Extractor, error) {
+	if key == "" {
+		return Extractor{}, errors.New("decoder: NewExtractor called with empty key")
+	}
+	return Extractor{key: key}, nil
+}
 
 // Name returns the extractor identifier.
 func (Extractor) Name() string {
@@ -26,7 +40,6 @@ func (Extractor) Name() string {
 }
 
 const (
-	channelKey           = "channel"
 	readerBufferSize     = 64 * 1024 // 64 KiB
 	shortStringScanLimit = 256
 	whitespaceScanLimit  = 64
@@ -35,6 +48,20 @@ const (
 
 	hexValueSize           = 4
 	lowSurrogateEscapeSize = 6 // `\u` + 4 hex digits
+
+	// wordOnes is a 64-bit mask with every byte set to 0x01.
+	// It is used to broadcast a constant to all 8 byte lanes in a word.
+	wordOnes uint64 = 0x0101010101010101
+
+	// wordHighs is a 64-bit mask with the high bit of every byte set (0x80).
+	// ANDing with this mask isolates the sign bit of each byte lane, which signals
+	// an underflow in the SWAR control-byte test.
+	wordHighs uint64 = 0x8080808080808080
+
+	// wordThreshold20 is wordOnes * 0x20, i.e. every byte lane set to 0x20 (space).
+	// Subtracting this from a word underflows any byte strictly less than 0x20,
+	// setting its high bit — detectable via wordHighs.
+	wordThreshold20 = wordOnes * 0x20
 )
 
 var readerPool = sync.Pool{
@@ -117,6 +144,7 @@ func (r *cappedReader) setMaxReadChunk(maxReadChunk int) {
 	r.maxReadChunk = maxReadChunk
 }
 
+// Read implements io.Reader, capping each call to maxReadChunk bytes.
 func (r *cappedReader) Read(p []byte) (int, error) {
 	if r.base == nil {
 		return 0, io.EOF
@@ -127,16 +155,28 @@ func (r *cappedReader) Read(p []byte) (int, error) {
 	return r.base.Read(p)
 }
 
-const (
-	wordOnes        uint64 = 0x0101010101010101
-	wordHighs       uint64 = 0x8080808080808080
-	wordThreshold20        = wordOnes * 0x20
-)
-
-func controlByteIndex(segment []byte) int {
+// controlByteIndex returns the index of the first byte in segment whose value
+// is strictly less than 0x20 (a JSON-invalid control character), or -1 if none
+// is found.
+//
+// The implementation uses SWAR (SIMD Within A Register): it processes 8 bytes
+// at a time by loading them as a uint64 and applying the bitmask test:
+//
+//	(word - threshold20) & ^word & wordHighs
+//
+// For each byte lane, subtracting 0x20 underflows (wraps) if and only if the
+// byte is < 0x20. The underflow sets the high bit of that lane; ANDing with
+// ^word clears false positives from bytes >= 0x80, and ANDing with wordHighs
+// isolates the high bit of each lane. A non-zero result means at least one
+// lane contains a control byte.
+//
+// The outer loop unrolls four 8-byte words (32 bytes) per iteration for
+// throughput on long segments. When a batch tests positive, a scalar fallback
+// pinpoints the exact byte within the batch.
+func (s *scanner) controlByteIndex(segment []byte) int {
 	const (
 		wordWidth  = 8
-		wordBatch4 = 4 * wordWidth
+		wordBatch4 = 4 * wordWidth // 32 bytes per unrolled iteration
 	)
 
 	n := len(segment)
@@ -182,57 +222,32 @@ func controlByteIndex(segment []byte) int {
 	return -1
 }
 
-// findStringStop returns the first byte that ends or alters string scanning:
-// quote, backslash escape, or invalid control byte (< 0x20).
-func findStringStop(chunk []byte) (int, byte) {
-	if len(chunk) <= shortStringScanLimit {
-		for i := 0; i < len(chunk); i++ {
-			b := chunk[i]
-			if b == '"' || b == '\\' || b < 0x20 {
-				return i, b
-			}
-		}
-		return -1, 0
+// findStringStop returns the index and value of the first byte in chunk that
+// requires action during string scanning: a closing '"', a '\' escape, or an
+// invalid control byte (< 0x20). Returns (-1, 0) when no such byte is found.
+//
+// For short chunks (≤ shortStringScanLimit) a scalar loop is used directly.
+// For larger chunks, bytes.IndexByte locates '"' and '\' first; controlByteIndex
+// then scans only the prefix up to the earliest special byte, avoiding a full
+// SWAR pass over the whole chunk when a quote or backslash appears early.
+func (s *scanner) findStringStop(chunk []byte) (int, byte) {
+	if i, b := s.findStringStopSkip(chunk); i >= 0 {
+		return i, b
 	}
-
-	quoteIndex := bytes.IndexByte(chunk, '"')
-	slashIndex := bytes.IndexByte(chunk, '\\')
-
-	specialIndex := -1
-	special := byte(0)
-	switch {
-	case quoteIndex == -1 && slashIndex == -1:
-		specialIndex = -1
-	case quoteIndex == -1:
-		specialIndex, special = slashIndex, '\\'
-	case slashIndex == -1:
-		specialIndex, special = quoteIndex, '"'
-	case quoteIndex < slashIndex:
-		specialIndex, special = quoteIndex, '"'
-	default:
-		specialIndex, special = slashIndex, '\\'
-	}
-
-	if specialIndex >= 0 {
-		if ctrlIndex := controlByteIndex(chunk[:specialIndex]); ctrlIndex >= 0 {
-			return ctrlIndex, chunk[ctrlIndex]
-		}
-		return specialIndex, special
-	}
-
-	if ctrlIndex := controlByteIndex(chunk); ctrlIndex >= 0 {
+	if ctrlIndex := s.controlByteIndex(chunk); ctrlIndex >= 0 {
 		return ctrlIndex, chunk[ctrlIndex]
 	}
-
 	return -1, 0
 }
 
 // findStringStopSkip is a fast variant of findStringStop for skip-only paths
-// (skipString). When neither '"' nor '\' is found in a large chunk, control
-// byte detection is skipped entirely: those bytes would only be discarded by
-// the caller and do not affect the extracted value. Control bytes that appear
-// before a '"' or '\' are still detected via controlByteIndex on the prefix.
-func findStringStopSkip(chunk []byte) (int, byte) {
+// (skipString). The correctness trade-off versus findStringStop is intentional:
+// when neither '"' nor '\' appears in a large chunk, the entire chunk is safe
+// to discard without inspecting for control bytes — those bytes are never
+// returned to the caller and cannot corrupt an extracted value. When a '"' or
+// '\' is found, controlByteIndex still scans the prefix before it, so control
+// bytes that precede a structural marker are not silently accepted.
+func (s *scanner) findStringStopSkip(chunk []byte) (int, byte) {
 	if len(chunk) <= shortStringScanLimit {
 		for i := 0; i < len(chunk); i++ {
 			b := chunk[i]
@@ -255,13 +270,16 @@ func findStringStopSkip(chunk []byte) (int, byte) {
 		specialIndex, special = slashIndex, '\\'
 	}
 
-	if ctrlIndex := controlByteIndex(chunk[:specialIndex]); ctrlIndex >= 0 {
+	if ctrlIndex := s.controlByteIndex(chunk[:specialIndex]); ctrlIndex >= 0 {
 		return ctrlIndex, chunk[ctrlIndex]
 	}
 	return specialIndex, special
 }
 
-// decodeHex4 parses a 4-hex-digit JSON unicode unit from content.
+// decodeHex4 parses exactly 4 hex digits from content into a uint16 code unit.
+// It accepts both upper- and lower-case hex digits (0–9, a–f, A–F) and returns
+// an error on any non-hex byte. content must be exactly hexValueSize (4) bytes;
+// a shorter slice is treated as an unexpected EOF.
 func (s *scanner) decodeHex4(content []byte) (uint16, error) {
 	if len(content) != hexValueSize {
 		return 0, s.invalidJSONf("unexpected EOF while reading unicode hex16 value")
@@ -301,8 +319,12 @@ func (s *scanner) readHex16() (uint16, error) {
 	return value, nil
 }
 
-// readLowSurrogateAfterHigh validates and consumes the low surrogate escape
-// that must follow an already read high surrogate.
+// readLowSurrogateAfterHigh validates and consumes the \uXXXX escape that must
+// immediately follow a high surrogate (U+D800–U+DBFF) already read from the
+// stream. JSON RFC 8259 §7 requires that a high surrogate be paired with a low
+// surrogate (U+DC00–U+DFFF) encoded as a second \uXXXX sequence. This method
+// peeks ahead to confirm the pattern "\uXXXX" is present before consuming it,
+// so the stream position is only advanced on success.
 func (s *scanner) readLowSurrogateAfterHigh() (uint16, error) {
 	content, err := s.peekBufferedChunk(lowSurrogateEscapeSize)
 	if err != nil {
@@ -337,8 +359,14 @@ func (s *scanner) readLowSurrogateAfterHigh() (uint16, error) {
 	return second, nil
 }
 
-// readUnicodeEscape decodes one JSON unicode escape sequence, including
-// surrogate pair handling when needed.
+// readUnicodeEscape decodes one JSON \uXXXX escape sequence. It handles all
+// three cases defined by RFC 8259 §7:
+//   - BMP scalar (U+0000–U+D7FF, U+E000–U+FFFF): returned directly as a rune.
+//   - High surrogate (U+D800–U+DBFF): must be followed by a low surrogate
+//     \uXXXX; both code units are consumed and decoded as a UTF-16 surrogate
+//     pair into a single Unicode scalar above U+FFFF.
+//   - Lone low surrogate (U+DC00–U+DFFF): invalid at this position; an error
+//     is returned without consuming further input.
 func (s *scanner) readUnicodeEscape() (rune, error) {
 	// JSON \uXXXX always starts with one 16-bit code unit.
 	first, err := s.readHex16()
@@ -409,7 +437,7 @@ func (s *scanner) readString() (string, error) {
 			return "", s.invalidJSONf("unexpected EOF while reading string")
 		}
 
-		index, special := findStringStop(chunk)
+		index, special := s.findStringStop(chunk)
 		segment := chunk
 		consumed := len(chunk)
 		if index >= 0 {
@@ -455,7 +483,7 @@ func (s *scanner) readKeyEquals(target string) (bool, error) {
 			return false, s.invalidJSONf("unexpected EOF while reading string")
 		}
 
-		specialIndex, special := findStringStop(chunk)
+		specialIndex, special := s.findStringStop(chunk)
 		segment := chunk
 		consumed := len(chunk)
 		if specialIndex >= 0 {
@@ -504,7 +532,7 @@ func (s *scanner) readKeyEquals(target string) (bool, error) {
 	}
 }
 
-// parseChannelValue reads "channel" value when it is a string, or skips the
+// parseChannelValue reads the target value when it is a string, or skips the
 // value and returns ErrChannelInvalidType for non-string values.
 func (s *scanner) parseChannelValue(start byte) (string, error) {
 	if start == '"' {
@@ -556,7 +584,7 @@ func (s *scanner) skipString() error {
 			return s.invalidJSONf("unexpected EOF while reading string")
 		}
 
-		index, special := findStringStopSkip(chunk)
+		index, special := s.findStringStopSkip(chunk)
 		if index < 0 {
 			if _, err := s.r.Discard(len(chunk)); err != nil {
 				return err
@@ -723,8 +751,17 @@ func (s *scanner) skipNumberFromStart(start byte) error {
 	}
 }
 
-// skipComposite skips a full object or array value, tracking nesting and
-// string/escape state so structural bytes inside strings are ignored.
+// skipComposite skips a complete JSON object or array, starting after the
+// opening '{' or '[' has already been consumed (depth begins at 1).
+//
+// The key invariant is that structural bytes ('{', '}', '[', ']') inside string
+// values must not affect the depth counter. To enforce this, the scanner
+// maintains an inString flag: while inside a string it delegates to
+// findStringStop to advance past plain text and detect '"' (end of string) or
+// '\' (escape sequence to validate). When an escape is found, skipEscape
+// consumes and validates the escape unit, then the outer loop restarts from a
+// fresh buffered chunk (via continue outer) because the chunk slice is now
+// stale. Outside strings, only '{', '[', '}', ']', and '"' are relevant.
 func (s *scanner) skipComposite() error {
 	depth := 1
 	inString := false
@@ -741,7 +778,7 @@ outer:
 			if inString {
 				// In string mode we only look for quote/escape markers. Any
 				// structural characters are plain text and must be ignored.
-				index, special := findStringStop(chunk[i:])
+				index, special := s.findStringStop(chunk[i:])
 				if index < 0 {
 					break
 				}
@@ -852,10 +889,13 @@ func (s *scanner) ensureDocumentEnd() error {
 	}
 }
 
-// Extract scans a top-level object and returns the root "channel" string value.
-// It exits early on the first top-level "channel" key and validates trailing
-// non-space bytes only when the object ends without a matching channel.
-func (Extractor) Extract(r io.Reader) (string, error) {
+// Extract scans a top-level object and returns the string value of the
+// configured key. It exits early on the first match and validates trailing
+// non-space bytes only when the object ends without a matching target key.
+func (e Extractor) Extract(r io.Reader) (string, error) {
+	if e.key == "" {
+		return "", errors.New("decoder: Extract called on zero-value Extractor; use NewExtractor")
+	}
 	br := readerPool.Get().(*bufio.Reader)
 	src := cappedReaderPool.Get().(*cappedReader)
 	src.reset(r, initialReadChunkCap)
@@ -896,7 +936,7 @@ func (Extractor) Extract(r io.Reader) (string, error) {
 			return "", fmt.Errorf("scan root object: %w", s.invalidJSONf("expected object key, got %q", start))
 		}
 
-		keyIsChannel, err := s.readKeyEquals(channelKey)
+		keyIsChannel, err := s.readKeyEquals(e.key)
 		if err != nil {
 			return "", fmt.Errorf("scan root object key: %w", err)
 		}
