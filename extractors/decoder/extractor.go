@@ -183,10 +183,10 @@ func (s *scanner) controlByteIndex(segment []byte) int {
 	i := 0
 
 	for ; i+wordBatch4 <= n; i += wordBatch4 {
-		u0 := binary.LittleEndian.Uint64(segment[i:])
-		u1 := binary.LittleEndian.Uint64(segment[i+8:])
-		u2 := binary.LittleEndian.Uint64(segment[i+16:])
-		u3 := binary.LittleEndian.Uint64(segment[i+24:])
+		u0 := binary.NativeEndian.Uint64(segment[i:])
+		u1 := binary.NativeEndian.Uint64(segment[i+8:])
+		u2 := binary.NativeEndian.Uint64(segment[i+16:])
+		u3 := binary.NativeEndian.Uint64(segment[i+24:])
 
 		if ((u0-wordThreshold20)&(^u0)&wordHighs) == 0 &&
 			((u1-wordThreshold20)&(^u1)&wordHighs) == 0 &&
@@ -202,7 +202,7 @@ func (s *scanner) controlByteIndex(segment []byte) int {
 	}
 
 	for ; i+wordWidth <= n; i += wordWidth {
-		x := binary.LittleEndian.Uint64(segment[i:])
+		x := binary.NativeEndian.Uint64(segment[i:])
 		if ((x - wordThreshold20) & (^x) & wordHighs) == 0 {
 			continue
 		}
@@ -766,13 +766,13 @@ func (s *scanner) skipComposite() error {
 	depth := 1
 	inString := false
 
-outer:
 	for {
 		chunk, err := s.peekBufferedChunk(0)
 		if err != nil {
 			return s.invalidJSONf("unexpected EOF while skipping composite value")
 		}
 
+		escaped := false
 		for i := 0; i < len(chunk); i++ {
 			b := chunk[i]
 			if inString {
@@ -791,15 +791,16 @@ outer:
 				if special < 0x20 {
 					return s.invalidJSONf("invalid control character in string")
 				}
-				// For escapes, consume up to '\' then validate the escaped unit
-				// via skipEscape, and restart from a fresh buffered chunk.
+				// Consume up to '\' then validate the escape unit. The chunk is
+				// now stale so break and let the outer loop re-peek.
 				if _, err := s.r.Discard(i + 1); err != nil {
 					return err
 				}
 				if err := s.skipEscape(); err != nil {
 					return err
 				}
-				continue outer
+				escaped = true
+				break
 			}
 
 			switch b {
@@ -818,8 +819,10 @@ outer:
 			}
 		}
 
-		if _, err := s.r.Discard(len(chunk)); err != nil {
-			return err
+		if !escaped {
+			if _, err := s.r.Discard(len(chunk)); err != nil {
+				return err
+			}
 		}
 	}
 }
